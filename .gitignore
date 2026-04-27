@@ -2,6 +2,13 @@ data_sample/faiss/
 data_sample/intermediate_cluster/
 data_sample/output/
 data_sample/cluster_rs/
+__pycache__/
+*.py[cod]
+*.log
+runs/
+code.md
+potential_direction.md
+report.md
 src/ray_serverless_volcano.py
 src/MOCO_greedy/construct_random_sampling.py
 src/semantic_clustering/isodata_varient.py

@@ -1,125 +1,149 @@
-# Phase 1. Semantic Clustering
-# 1.1. decide initial cluster number
-# depend on CPU ray cluster
-import faiss
-import numpy as np
-from tqdm import tqdm
-import ujson
+"""Phase 1.1: estimate semantic density and build per-file FAISS indices."""
+
+import argparse
 import ast
-import ray
+import logging
 import os
 
-# FAISS
-dimension = 1024 # embedding dimension using bge-m3 is 1024
+import faiss
+import numpy as np
+import ray
+import ujson
+from tqdm import tqdm
 
-# density list
-density_list = []
 
-# biuld FAISS index for each file
-@ray.remote
-def build_sample_index(args): # need args[0], args[1]
-    # Create an index  
-    index = faiss.IndexHNSWFlat(dimension, 32, faiss.METRIC_INNER_PRODUCT) # 64
+DIMENSION = 1024
+formatter = logging.Formatter("[%(asctime)s] %(message)s", "%Y%m%d %H:%M:%S")
 
-    input_file_path, faiss_output_path = args[0], args[1]
-    try:
-        embedding_list = [] # 2-dimension (for adding FAISS index)
-        with open(input_file_path, "r", encoding="utf-8", errors="ignore") as fin:
-            for idx, line in enumerate(fin):
-                try:
-                    line_dict = ujson.loads(line.replace("\n", "").replace('\\/', '/'))
-                    embedding_list.append(ast.literal_eval(line_dict["vector_encoded"]))
-                except ValueError as e:
-                    print(f"JSON parser error: {e}")
-        if len(embedding_list) > 0: 
-            vectors = np.array(embedding_list).astype('float32')
-            index.add(vectors)
-    
-    except OSError as e:  
-        print(f"An error occurred: {e}")
-    
-    # Save the index to disk
-    faiss.write_index(index, faiss_output_path)
-    
-@ray.remote
-def compute_density(args): # need args[0], args[1]
-    index = faiss.read_index(args[1]) # read FAISS index
-    
-<<<<<<< HEAD
-    # get total line number
-    line_num = subprocess.run(['wc', '-l', args[0]], stdout=subprocess.PIPE)
-    line_count = int(line_num.stdout.split()[0])
-    print(f"total line number: {line_count}")
-    
-=======
->>>>>>> 75c05ce66d10d9b35b3374f5a5ba06a3c0e10d77
-    part_density = 0
-    with open(args[0], "r", encoding="utf-8", errors="ignore") as fin:
-        for idx, line in enumerate(fin):
+
+def get_logger(name, log_file, level=logging.INFO):
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(formatter)
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    if not logger.handlers:
+        logger.addHandler(handler)
+    return logger
+
+
+def parse_vector(value):
+    if isinstance(value, str):
+        value = ast.literal_eval(value)
+    vector = np.asarray(value, dtype="float32")
+    norm = np.linalg.norm(vector)
+    if norm > 0:
+        vector = vector / norm
+    return vector
+
+
+def load_vectors(input_file_path):
+    vectors = []
+    with open(input_file_path, "r", encoding="utf-8", errors="ignore") as fin:
+        for line in fin:
             try:
-                line_dict = ujson.loads(line.replace("\n", "").replace('\\/', '/'))
-                search_vector = np.array([ast.literal_eval(line_dict["vector_encoded"])])
-<<<<<<< HEAD
-                D, I = index.search(search_vector, line_count)
-                line_dict["cluster_distance"] = float(D[0][0])
-                
-                idx_density = np.mean(np.array([float(x) for x in D[0]])) # average distance for the current vector
-                
-                part_density = (idx_density + part_density * idx) / (idx + 1)
-=======
-                D, I = index.search(search_vector, 2) # nearest 2
-                line_dict["cluster_distance"] = float(D[0][0])
-                part_density = (line_dict["cluster_distance"] + part_density * idx) / (idx + 1)
->>>>>>> 75c05ce66d10d9b35b3374f5a5ba06a3c0e10d77
-            
-            except ValueError as e:
-                print(f"JSON 解析错误: {e}")
-                
-    density_list.append(part_density)
+                line_dict = ujson.loads(line.replace("\n", "").replace("\\/", "/"))
+                vectors.append(parse_vector(line_dict["vector_encoded"]))
+            except (ValueError, KeyError, SyntaxError) as e:
+                print(f"Skipping malformed row in {input_file_path}: {e}")
+    if not vectors:
+        return np.empty((0, DIMENSION), dtype="float32")
+    return np.vstack(vectors).astype("float32")
 
-# store status dictionary
-def process_incremental(status_all, status_dict):
-    status_all.append(status_dict)
-    return status_all
-    
+
+@ray.remote
+def build_sample_index(args):
+    input_file_path, faiss_output_path = args
+    vectors = load_vectors(input_file_path)
+    index = faiss.IndexHNSWFlat(DIMENSION, 32, faiss.METRIC_INNER_PRODUCT)
+    if len(vectors) > 0:
+        index.add(vectors)
+    os.makedirs(os.path.dirname(faiss_output_path), exist_ok=True)
+    faiss.write_index(index, faiss_output_path)
+    return {"input_file": input_file_path, "vectors": len(vectors)}
+
+
+@ray.remote
+def compute_density(args):
+    input_file_path, faiss_index_path, nearest_k = args
+    vectors = load_vectors(input_file_path)
+    if len(vectors) <= 1:
+        return 1.0 if len(vectors) == 1 else 0.0
+
+    index = faiss.read_index(faiss_index_path)
+    k = min(max(2, nearest_k + 1), len(vectors))
+    distances, _ = index.search(vectors, k)
+
+    # The first neighbor is usually the query itself. Use the rest as local
+    # semantic density and clamp to a sampling probability later.
+    neighbor_scores = distances[:, 1:k]
+    return float(np.mean(neighbor_scores))
+
+
+def iter_embedding_files(embedding_folder):
+    for dirpath, _, filenames in os.walk(embedding_folder):
+        for filename in sorted(filenames):
+            yield os.path.join(dirpath, filename)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Estimate semantic density from embedded JSONL files.")
+    parser.add_argument("--embedding-folder", required=True)
+    parser.add_argument("--faiss-output-folder", required=True)
+    parser.add_argument("--semantic-density-file", required=True)
+    parser.add_argument("--nearest-k", type=int, default=8)
+    parser.add_argument("--ray-address", default=None)
+    parser.add_argument("--log-file", default="node_num_decision.log")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ray_log = get_logger("ray_faiss_index", args.log_file)
+    ray_log.info("--- start semantic density task ---")
+
+    if args.ray_address:
+        ray.init(address=args.ray_address)
+    else:
+        ray.init()
+
+    os.makedirs(args.faiss_output_folder, exist_ok=True)
+    os.makedirs(os.path.dirname(args.semantic_density_file), exist_ok=True)
+
+    embedding_files = list(iter_embedding_files(args.embedding_folder))
+    if not embedding_files:
+        raise FileNotFoundError(f"No embedding files found in {args.embedding_folder}")
+
+    index_args = [
+        (file_path, os.path.join(args.faiss_output_folder, os.path.basename(file_path) + ".faiss"))
+        for file_path in embedding_files
+    ]
+    ray_log.info(f"total num of files: {len(index_args)}")
+
+    pending = [build_sample_index.remote(item) for item in index_args]
+    while pending:
+        done_ids, pending = ray.wait(pending)
+        ray_log.info(ray.get(done_ids[0]))
+
+    density_args = [
+        (input_file, index_file, args.nearest_k)
+        for input_file, index_file in index_args
+    ]
+    pending = [compute_density.remote(item) for item in density_args]
+    densities = []
+    while pending:
+        done_ids, pending = ray.wait(pending)
+        densities.append(ray.get(done_ids[0]))
+
+    cluster_density = float(np.mean(densities)) if densities else 0.0
+    sampling_probability = min(1.0, max(0.001, cluster_density))
+
+    print(f"Semantic Density: {cluster_density}")
+    print(f"Sampling Probability: {sampling_probability}")
+    with open(args.semantic_density_file, "w", encoding="utf-8") as fout:
+        fout.write(str(sampling_probability))
+
+    ray.shutdown()
+
+
 if __name__ == "__main__":
-    ray_log = get_logger("ray_faiss_index", "node_num_decision.log")
-    ray_log.info("--- start new ray task ---")
-    ray.init(address="auto")
-    
-    raw_data_folder = "/path/to/embedding_folder/" # path to the embedding folder (/xxx/DataSculpt/data_sample/embedding_rs/)
-    faiss_output_folder = "/path/to/part_faiss/" # path to the part_faiss folder (/xxx/DataSculpt/data_sample/faiss/part_faiss/)
-
-    args_list = []
-    for dirpath, dirnames, filenames in os.walk(raw_data_folder):
-        for i, filename in enumerate(tqdm(filenames, total=len(filenames))):
-            file_path = os.path.join(dirpath, filename)
-            args_list.append((file_path, faiss_output_folder + filename)) # [input_file_path, faiss_index_output_path]
-    
-    ray_log.info(f"total num of files: {len(args_list)}")
-    
-    status_all = []
-    # step1: build faiss index
-    rs_ids = [build_sample_index.remote(args) for args in args_list] # .options(memory=2.5 * 1024 * 1024 * 1024)
-    while len(rs_ids):
-        done_ids, rs_ids = ray.wait(rs_ids)
-        status_all = process_incremental(status_all, ray.get(done_ids[0]))
-        ray_log.info(status_all[-1])
-        ray_log.info(
-            f"total {len(args_list)} tasks, {len(rs_ids)} tasks waiting, {len(status_all)} tasks done."
-        )
-        
-    # step2: compute density
-    rs_ids = [compute_density.remote(args) for args in args_list] # .options(memory=2.5 * 1024 * 1024 * 1024)
-    while len(rs_ids):
-        done_ids, rs_ids = ray.wait(rs_ids)
-        status_all = process_incremental(status_all, ray.get(done_ids[0]))
-        ray_log.info(status_all[-1])
-        ray_log.info(
-            f"total {len(args_list)} tasks, {len(rs_ids)} tasks waiting, {len(status_all)} tasks done."
-        )
-
-    cluster_density = density_list.mean() # mean of density list
-    print(f"Semantic Density: {cluster_density}") # This result is all you need!
-    with open("semantic_density.txt", "w") as f:
-        f.write(str(cluster_density))
+    main()

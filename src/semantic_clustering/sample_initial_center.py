@@ -1,110 +1,129 @@
-# Phase 1. Semantic Clustering
-<<<<<<< HEAD
-# 1.2. initial cluster center
-=======
-# 1.2. initial cluster center (sample data)
->>>>>>> 75c05ce66d10d9b35b3374f5a5ba06a3c0e10d77
+"""Phase 1.2: sample initial cluster centers from embedded documents."""
 
-import numpy as np
-from tqdm import tqdm
-import random
-import ujson
-import os
-import ast
-import subprocess
-import time
-import datetime
-import ray
-
+import argparse
 import logging
+import os
+import random
+
+import ray
+import ujson
+from tqdm import tqdm
+
+
 formatter = logging.Formatter("[%(asctime)s] %(message)s", "%Y%m%d %H:%M:%S")
+
+
 def get_logger(name, log_file, level=logging.INFO):
     handler = logging.FileHandler(log_file)
     handler.setFormatter(formatter)
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    logger.addHandler(handler)
+    if not logger.handlers:
+        logger.addHandler(handler)
     return logger
+
+
+def iter_embedding_files(embedding_folder):
+    for dirpath, _, filenames in os.walk(embedding_folder):
+        for filename in sorted(filenames):
+            yield os.path.join(dirpath, filename)
+
+
+def read_probability(path):
+    with open(path, "r", encoding="utf-8") as fin:
+        return min(1.0, max(0.001, float(fin.read().strip())))
+
 
 @ray.remote
 def sample_node(args):
-    # get total line number 
-    line_num = subprocess.run(['wc', '-l', args[0]], stdout=subprocess.PIPE)  
-    line_count = int(line_num.stdout.split()[0])
-    print(f"total line number: {line_count}")
-        
-    chosen_prob = 100 / line_count # initial sample rate
-    with open("semantic_density.txt", "r") as f:
-        chosen_prob = float(f.read())
+    input_file, output_file, chosen_prob, seed = args
+    rng = random.Random(seed)
+    sampled = []
 
-    with open(args[0], "r", encoding="utf-8", errors="ignore") as fin, open(
-              args[1], "a", encoding="utf-8", errors="ignore") as fout:
-        for idx, line in enumerate(fin):
-            if random.random() < chosen_prob:
+    with open(input_file, "r", encoding="utf-8", errors="ignore") as fin:
+        for line in fin:
+            if rng.random() < chosen_prob:
                 try:
-                    line_dict = ujson.loads(line.replace("\n", "").replace('\\/', '/'))
-                    fout.write(ujson.dumps(line_dict, ensure_ascii = False) + "\n") # 写入 sampled node 文件
+                    sampled.append(ujson.loads(line.replace("\n", "").replace("\\/", "/")))
                 except ValueError as e:
-                    print(f"JSON 解析错误: {e}")
+                    print(f"JSON parser error in {input_file}: {e}")
 
-# store status dictionary
-def process_incremental(status_all, status_dict):
-    status_all.append(status_dict)
-    return status_all
+    if not sampled:
+        with open(input_file, "r", encoding="utf-8", errors="ignore") as fin:
+            first_line = fin.readline()
+            if first_line:
+                sampled.append(ujson.loads(first_line.replace("\n", "").replace("\\/", "/")))
 
-<<<<<<< HEAD
-def merge_sample_nodes(sample_nodes_folder, output_merged_folder):
-    # merge all sample nodes
-    with open(output_merged_folder + "sample_nodes_0.jsonl", "a", encoding="utf-8", errors="ignore") as fout:
-        for dirpath, dirnames, filenames in os.walk(sample_nodes_folder):
-            for i, filename in enumerate(tqdm(filenames, total=len(filenames))):
-                file_path = os.path.join(dirpath, filename)
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as fin:
-                    for idx, line in enumerate(fin):
-                        try:
-                            line_dict = ujson.loads(line.replace("\n", "").replace('\\/', '/'))
-                            fout.write(ujson.dumps(line_dict, ensure_ascii = False) + "\n")
-                        except ValueError as e:
-                            print(f"JSON parser error: {e}")
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8", errors="ignore") as fout:
+        for row in sampled:
+            fout.write(ujson.dumps(row, ensure_ascii=False) + "\n")
 
-if __name__ == "__main__":
-    ray_log = get_logger("ray_initial_center", "ray_initial_center.log")
-=======
-if __name__ == "__main__":
-    ray_log = get_logger("ray_faiss_index", "ray_initial_center.log")
->>>>>>> 75c05ce66d10d9b35b3374f5a5ba06a3c0e10d77
-    ray_log.info("--- start new ray task ---")
-    ray.init(address="auto")
-    
-    raw_data_folder = "/path/to/embedding_folder/" # path to the embedding folder (/xxx/DataSculpt/data_sample/embedding_rs/)
-<<<<<<< HEAD
-    output_root_folder, output_merged_folder = "/path/to/sample_nodes/", "/path/to/merged_nodes/" # /xxx/DataSculpt/data_sample/faiss/center_nodes/, /xxx/DataSculpt/data_sample/intermediate_cluster/
-=======
-    output_root_folder = "/path/to/sample_nodes/" # /xxx/DataSculpt/data_sample/faiss/center_nodes/
->>>>>>> 75c05ce66d10d9b35b3374f5a5ba06a3c0e10d77
-    os.makedirs(output_root_folder, exist_ok=True)
+    return {"input_file": input_file, "sampled": len(sampled)}
 
-    args_list = []
-    for dirpath, dirnames, filenames in os.walk(raw_data_folder):
-        for i, filename in enumerate(tqdm(filenames, total=len(filenames))):
-            file_path = os.path.join(dirpath, filename)
-            args_list.append((file_path, output_root_folder + filename)) # [input_file_path, output_file_path]
-                
-    ray_log.info(f"total num of files: {len(args_list)}")
-    
-    status_all = []
-    # build tasks
-    rs_ids = [sample_node.remote(args) for args in args_list] # .options(memory=2.5 * 1024 * 1024 * 1024)
-    while len(rs_ids):
-        done_ids, rs_ids = ray.wait(rs_ids)
-        status_all = process_incremental(status_all, ray.get(done_ids[0]))
-        ray_log.info(status_all[-1])
-        ray_log.info(
-            f"total {len(args_list)} tasks, {len(rs_ids)} tasks waiting, {len(status_all)} tasks done."
+
+def merge_sample_nodes(sample_nodes_folder, output_file):
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    total = 0
+    with open(output_file, "w", encoding="utf-8", errors="ignore") as fout:
+        for file_path in iter_embedding_files(sample_nodes_folder):
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as fin:
+                for line in fin:
+                    fout.write(line)
+                    total += 1
+    if total == 0:
+        raise RuntimeError("No initial center nodes were sampled.")
+    return total
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sample initial ISODATA centers.")
+    parser.add_argument("--embedding-folder", required=True)
+    parser.add_argument("--sample-output-folder", required=True)
+    parser.add_argument("--merged-output-file", required=True)
+    parser.add_argument("--semantic-density-file", required=True)
+    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--ray-address", default=None)
+    parser.add_argument("--log-file", default="ray_initial_center.log")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ray_log = get_logger("ray_initial_center", args.log_file)
+    ray_log.info("--- start initial center sampling task ---")
+
+    if args.ray_address:
+        ray.init(address=args.ray_address)
+    else:
+        ray.init()
+
+    chosen_prob = read_probability(args.semantic_density_file)
+    embedding_files = list(iter_embedding_files(args.embedding_folder))
+    if not embedding_files:
+        raise FileNotFoundError(f"No embedding files found in {args.embedding_folder}")
+
+    task_args = [
+        (
+            file_path,
+            os.path.join(args.sample_output_folder, os.path.basename(file_path)),
+            chosen_prob,
+            args.seed + idx,
         )
-<<<<<<< HEAD
+        for idx, file_path in enumerate(embedding_files)
+    ]
 
-    # merge all sample nodes
-    merge_sample_nodes(output_root_folder, output_merged_folder)
-=======
->>>>>>> 75c05ce66d10d9b35b3374f5a5ba06a3c0e10d77
+    pending = [sample_node.remote(item) for item in task_args]
+    while pending:
+        done_ids, pending = ray.wait(pending)
+        ray_log.info(ray.get(done_ids[0]))
+
+    total = merge_sample_nodes(args.sample_output_folder, args.merged_output_file)
+    ray_log.info(f"merged sampled centers: {total}")
+    print(f"Merged sampled centers: {total}")
+
+    ray.shutdown()
+
+
+if __name__ == "__main__":
+    main()
